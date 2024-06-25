@@ -5,7 +5,6 @@ import { useMemo, useState } from 'react';
 
 // @snippet:start(client.config)
 fal.config({
-  // credentials: 'FAL_KEY_ID:FAL_KEY_SECRET',
   proxyUrl: '/api/fal/proxy', // the built-int nextjs proxy
   // proxyUrl: 'http://localhost:3333/api/fal/proxy', // or your own external proxy
 });
@@ -13,12 +12,16 @@ fal.config({
 
 // @snippet:start(client.result.type)
 type Image = {
+  filename: string;
+  subfolder: string;
+  type: string;
   url: string;
-  file_name: string;
-  file_size: number;
 };
+
 type Result = {
-  image: Image;
+  url: string;
+  outputs: Record<string, any>[];
+  images: Image[];
 };
 // @snippet:end
 
@@ -41,9 +44,9 @@ function Error(props: ErrorProps) {
 }
 
 const DEFAULT_PROMPT =
-  '(masterpiece:1.4), (best quality), (detailed), Medieval village scene with busy streets and castle in the distance';
+  'photograph of victorian woman with wings, sky clouds, meadow grass';
 
-export default function Home() {
+export default function ComfyImageToImagePage() {
   // @snippet:start("client.ui.state")
   // Input state
   const [prompt, setPrompt] = useState<string>(DEFAULT_PROMPT);
@@ -55,14 +58,11 @@ export default function Home() {
   const [logs, setLogs] = useState<string[]>([]);
   const [elapsedTime, setElapsedTime] = useState<number>(0);
   // @snippet:end
-  const image = useMemo(() => {
+  const video = useMemo(() => {
     if (!result) {
       return null;
     }
-    if (result.image) {
-      return result.image;
-    }
-    return null;
+    return result;
   }, [result]);
 
   const reset = () => {
@@ -73,30 +73,36 @@ export default function Home() {
     setElapsedTime(0);
   };
 
-  const generateImage = async () => {
+  const getImageURL = (result: Result) => {
+    return result.outputs[9].images[0];
+  };
+
+  const generateVideo = async () => {
     reset();
     // @snippet:start("client.queue.subscribe")
     setLoading(true);
     const start = Date.now();
     try {
-      const result: Result = await fal.subscribe('fal-ai/illusion-diffusion', {
-        input: {
-          prompt,
-          image_url: imageFile,
-          image_size: 'square_hd',
-        },
-        logs: true,
-        onQueueUpdate(update) {
-          setElapsedTime(Date.now() - start);
-          if (
-            update.status === 'IN_PROGRESS' ||
-            update.status === 'COMPLETED'
-          ) {
-            setLogs((update.logs || []).map((log) => log.message));
-          }
-        },
-      });
-      setResult(result);
+      const result: Result = await fal.subscribe(
+        'comfy/fal-ai/image-to-image',
+        {
+          input: {
+            prompt: prompt,
+            loadimage_1: imageFile,
+          },
+          logs: true,
+          onQueueUpdate(update) {
+            setElapsedTime(Date.now() - start);
+            if (
+              update.status === 'IN_PROGRESS' ||
+              update.status === 'COMPLETED'
+            ) {
+              setLogs((update.logs || []).map((log) => log.message));
+            }
+          },
+        }
+      );
+      setResult(getImageURL(result));
     } catch (error: any) {
       setError(error);
     } finally {
@@ -109,21 +115,33 @@ export default function Home() {
     <div className="min-h-screen dark:bg-gray-900 bg-gray-100">
       <main className="container dark:text-gray-50 text-gray-900 flex flex-col items-center justify-center w-full flex-1 py-10 space-y-8">
         <h1 className="text-4xl font-bold mb-8">
-          Hello <code className="font-light text-pink-600">fal</code>
+          Comfy SD1.5 - Image to Image
         </h1>
         <div className="text-lg w-full">
-          <label htmlFor="prompt" className="block mb-2 text-current">
+          <label htmlFor="image" className="block mb-2 text-current">
             Image
           </label>
-          <input
-            className="w-full text-lg p-2 rounded bg-black/10 dark:bg-white/5 border border-black/20 dark:border-white/10"
-            id="image_url"
-            name="image_url"
-            type="file"
-            placeholder="Choose a file"
-            accept="image/*"
-            onChange={(e) => setImageFile(e.target.files?.[0] ?? null)}
-          />
+          <div className="w-full flex flex-col space-y-4">
+            <div className="mx-auto flex">
+              {imageFile && (
+                <img
+                  src={URL.createObjectURL(imageFile)}
+                  alt=""
+                  className="mx-auto w-1/2"
+                />
+              )}
+            </div>
+
+            <input
+              className="w-full text-sm p-2 rounded bg-black/10 dark:bg-white/5 border border-black/20 dark:border-white/10"
+              id="image_url"
+              name="image_url"
+              type="file"
+              placeholder="Choose a file"
+              accept="image/*"
+              onChange={(e) => setImageFile(e.target.files?.[0] ?? null)}
+            />
+          </div>
         </div>
         <div className="text-lg w-full">
           <label htmlFor="prompt" className="block mb-2 text-current">
@@ -144,7 +162,7 @@ export default function Home() {
         <button
           onClick={(e) => {
             e.preventDefault();
-            generateImage();
+            generateVideo();
           }}
           className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-lg py-3 px-6 mx-auto rounded focus:outline-none focus:shadow-outline"
           disabled={loading}
@@ -156,9 +174,9 @@ export default function Home() {
 
         <div className="w-full flex flex-col space-y-4">
           <div className="mx-auto">
-            {image && (
+            {video && (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={image.url} alt="" />
+              <img src={video.url} alt="" />
             )}
           </div>
           <div className="space-y-2">

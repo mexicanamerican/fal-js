@@ -5,7 +5,6 @@ import { useMemo, useState } from 'react';
 
 // @snippet:start(client.config)
 fal.config({
-  // credentials: 'FAL_KEY_ID:FAL_KEY_SECRET',
   proxyUrl: '/api/fal/proxy', // the built-int nextjs proxy
   // proxyUrl: 'http://localhost:3333/api/fal/proxy', // or your own external proxy
 });
@@ -13,12 +12,16 @@ fal.config({
 
 // @snippet:start(client.result.type)
 type Image = {
+  filename: string;
+  subfolder: string;
+  type: string;
   url: string;
-  file_name: string;
-  file_size: number;
 };
+
 type Result = {
-  image: Image;
+  url: string;
+  outputs: Record<string, any>[];
+  images: Image[];
 };
 // @snippet:end
 
@@ -41,13 +44,12 @@ function Error(props: ErrorProps) {
 }
 
 const DEFAULT_PROMPT =
-  '(masterpiece:1.4), (best quality), (detailed), Medieval village scene with busy streets and castle in the distance';
+  'a city landscape of a cyberpunk metropolis, raining, purple, pink and teal neon lights, highly detailed, uhd';
 
-export default function Home() {
+export default function ComfyTextToImagePage() {
   // @snippet:start("client.ui.state")
   // Input state
   const [prompt, setPrompt] = useState<string>(DEFAULT_PROMPT);
-  const [imageFile, setImageFile] = useState<File | null>(null);
   // Result state
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
@@ -59,10 +61,7 @@ export default function Home() {
     if (!result) {
       return null;
     }
-    if (result.image) {
-      return result.image;
-    }
-    return null;
+    return result;
   }, [result]);
 
   const reset = () => {
@@ -73,17 +72,19 @@ export default function Home() {
     setElapsedTime(0);
   };
 
+  const getImageURL = (result: Result) => {
+    return result.outputs[9].images[0];
+  };
+
   const generateImage = async () => {
     reset();
     // @snippet:start("client.queue.subscribe")
     setLoading(true);
     const start = Date.now();
     try {
-      const result: Result = await fal.subscribe('fal-ai/illusion-diffusion', {
+      const result: Result = await fal.subscribe('comfy/fal-ai/text-to-image', {
         input: {
-          prompt,
-          image_url: imageFile,
-          image_size: 'square_hd',
+          prompt: prompt,
         },
         logs: true,
         onQueueUpdate(update) {
@@ -96,7 +97,7 @@ export default function Home() {
           }
         },
       });
-      setResult(result);
+      setResult(getImageURL(result));
     } catch (error: any) {
       setError(error);
     } finally {
@@ -108,23 +109,7 @@ export default function Home() {
   return (
     <div className="min-h-screen dark:bg-gray-900 bg-gray-100">
       <main className="container dark:text-gray-50 text-gray-900 flex flex-col items-center justify-center w-full flex-1 py-10 space-y-8">
-        <h1 className="text-4xl font-bold mb-8">
-          Hello <code className="font-light text-pink-600">fal</code>
-        </h1>
-        <div className="text-lg w-full">
-          <label htmlFor="prompt" className="block mb-2 text-current">
-            Image
-          </label>
-          <input
-            className="w-full text-lg p-2 rounded bg-black/10 dark:bg-white/5 border border-black/20 dark:border-white/10"
-            id="image_url"
-            name="image_url"
-            type="file"
-            placeholder="Choose a file"
-            accept="image/*"
-            onChange={(e) => setImageFile(e.target.files?.[0] ?? null)}
-          />
-        </div>
+        <h1 className="text-4xl font-bold mb-8">Comfy SDXL - Text to Image</h1>
         <div className="text-lg w-full">
           <label htmlFor="prompt" className="block mb-2 text-current">
             Prompt
