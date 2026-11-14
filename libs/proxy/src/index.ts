@@ -1,46 +1,193 @@
-export const TARGET_URL_HEADER = 'x-fal-target-url';
+import { fetchWithBackupDomain } from "./backup-domain";
+import {
+  applyProxyConfig,
+  createUrlMatcher,
+  DEFAULT_ALLOWED_URL_PATTERNS,
+  type ProxyConfig,
+} from "./config";
+import { getProxyUserAgent } from "./runtime";
+import type { HeaderValue, ProxyBehavior } from "./types";
+import { singleHeaderValue } from "./utils";
 
-export const DEFAULT_PROXY_ROUTE = '/api/fal/proxy';
+export {
+  createUrlMatcher,
+  DEFAULT_ALLOWED_URL_PATTERNS,
+  resolveProxyConfig,
+  type ProxyConfig,
+} from "./config";
+export { type HeaderValue, type ProxyBehavior } from "./types";
+
+export const TARGET_URL_HEADER = "x-fal-target-url";
+
+export const DEFAULT_PROXY_ROUTE = "/api/fal/proxy";
 
 const FAL_KEY = process.env.FAL_KEY;
 const FAL_KEY_ID = process.env.FAL_KEY_ID;
 const FAL_KEY_SECRET = process.env.FAL_KEY_SECRET;
 
-export type HeaderValue = string | string[] | undefined | null;
-
-const FAL_URL_REG_EXP = /(\.|^)fal\.(run|ai)$/;
+// Default matcher using the default allowed URL patterns
+const defaultUrlMatcher = createUrlMatcher(DEFAULT_ALLOWED_URL_PATTERNS);
 
 /**
- * The proxy behavior that is passed to the proxy handler. This is a subset of
- * request objects that are used by different frameworks, like Express and NextJS.
+ * Checks if a URL matches any of the allowed URL patterns.
+ *
+ * @param url the URL to check (without scheme, e.g., "fal.run/path").
+ * @param patterns the allowed URL patterns (glob-style). If not provided, uses default patterns.
+ * @returns whether the URL is allowed.
  */
-export interface ProxyBehavior<ResponseType> {
-  id: string;
-  method: string;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  respondWith(status: number, data: string | any): ResponseType;
-  getHeaders(): Record<string, HeaderValue>;
-  getHeader(name: string): HeaderValue;
-  sendHeader(name: string, value: string): void;
-  getBody(): Promise<string | undefined>;
-  resolveApiKey?: () => Promise<string | undefined>;
+export function isAllowedUrl(url: string, patterns?: string[]): boolean {
+  if (patterns) {
+    return createUrlMatcher(patterns)(url);
+  }
+  return defaultUrlMatcher(url);
+}
+
+// Only these WMA bridge routes may use the service-host allowlist bypass. App-scoped routes carry
+// the fal app identity in JSON; the heartbeat acts only on an already-authorized session.
+const SERVICE_APP_SCOPED_PATHS = new Set(["/ice", "/session"]);
+const SERVICE_SESSION_SCOPED_PATHS = new Set(["/session/heartbeat"]);
+
+function normalizeServicePath(url: URL): string | undefined {
+  try {
+    const path = decodeURIComponent(url.pathname).replace(/\/{2,}/g, "/");
+    return path.replace(/\/+$/, "") || "/";
+  } catch {
+    return undefined;
+  }
+}
+
+function countJsonKeys(body: string, key: string): number {
+  let count = 0;
+  for (let index = 0; index < body.length; index++) {
+    if (body[index] !== '"') continue;
+    const start = index;
+    for (index++; index < body.length; index++) {
+      if (body[index] === "\\") {
+        index++;
+        continue;
+      }
+      if (body[index] !== '"') continue;
+
+      let next = index + 1;
+      while (/\s/.test(body[next] ?? "")) next++;
+      if (body[next] === ":") {
+        try {
+          if (JSON.parse(body.slice(start, index + 1)) === key) count++;
+        } catch {
+          // The full parse below rejects malformed JSON. This scan only detects duplicate keys.
+        }
+      }
+      break;
+    }
+  }
+  return count;
+}
+
+function appIdFromRequestBody(body: string | undefined): string | undefined {
+  if (!body || countJsonKeys(body, "app_id") > 1) return undefined;
+  try {
+    const value = JSON.parse(body) as { app_id?: unknown };
+    return typeof value.app_id === "string" ? value.app_id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
- * Utility to get a header value as `string` from a Headers object.
+ * Parses the target URL and applies the checks every target must pass before the allowlists run.
  *
- * @private
- * @param request the header value.
- * @returns the header value as `string` or `undefined` if the header is not set.
+ * @param value the raw `x-fal-target-url` header value.
+ * @returns the parsed URL, or `undefined` when the target must be refused.
  */
-function singleHeaderValue(value: HeaderValue): string | undefined {
-  if (!value) {
+function parseTargetUrl(value: string): URL | undefined {
+  let target: URL;
+  try {
+    target = new URL(value);
+  } catch {
     return undefined;
   }
-  if (Array.isArray(value)) {
-    return value[0];
+  // Credentials only ever travel over TLS, and never to a URL carrying its own userinfo.
+  if (target.protocol !== "https:" || target.username || target.password) {
+    return undefined;
   }
-  return value;
+  // The URL parser resolves dot segments but keeps encoded separators, so `a/..%2fb` would be
+  // matched here as a child of `a` while a decoding upstream could route it elsewhere.
+  if (/%(?:2f|5c)/i.test(target.pathname)) {
+    return undefined;
+  }
+  return target;
+}
+
+// Queue routes scoped to a single request. They address the app as `<owner>/<alias>` (plus an
+// optional namespace) regardless of the endpoint path the request was submitted to.
+const QUEUE_REQUEST_PATH =
+  /^((?:(?:workflows|comfy)\/)?[^/]+\/[^/]+)\/requests\/[^/]+(?:\/(?:status|status\/stream|cancel))?$/;
+
+/**
+ * Checks if a queue request route (status, result, cancel) belongs to an app that the allowed
+ * endpoint patterns cover. Since these routes drop the endpoint path, a pattern is compared by
+ * its leading segments: `fal-ai/flux/dev` covers the requests of `fal-ai/flux`.
+ */
+function isAllowedQueueRequest(endpoint: string, patterns: string[]): boolean {
+  const app = QUEUE_REQUEST_PATH.exec(endpoint)?.[1];
+  if (!app) {
+    return false;
+  }
+  const depth = app.split("/").length;
+  return patterns.some((pattern) => {
+    const segments = pattern.split("/");
+    const globstar = segments.findIndex((segment) => segment.includes("**"));
+    const end = globstar >= 0 && globstar < depth ? globstar + 1 : depth;
+    return createUrlMatcher([segments.slice(0, end).join("/")])(app);
+  });
+}
+
+// Upstream response headers handed back to the caller. Everything else is dropped: the upstream
+// must not set cookies, caching, CORS or content policy on the origin that hosts the proxy.
+const FORWARDED_RESPONSE_HEADERS = new Set(["content-type", "retry-after"]);
+
+function isForwardedResponseHeader(name: string): boolean {
+  const key = name.toLowerCase();
+  return FORWARDED_RESPONSE_HEADERS.has(key) || key.startsWith("x-fal-");
+}
+
+/**
+ * Checks if the URL is on the fal.ai domain or any of its subdomains.
+ * @param targetUrl the full URL including scheme.
+ * @returns true if the URL is on *.fal.ai domain.
+ */
+function isFalAiDomain(targetUrl: string): boolean {
+  const url = new URL(targetUrl);
+  return url.host === "fal.ai" || url.host.endsWith(".fal.ai");
+}
+
+/**
+ * Extracts the endpoint from a URL (path without leading slash).
+ * @param targetUrl the full URL including scheme.
+ * @returns the endpoint (path without leading slash).
+ */
+export function getEndpoint(targetUrl: string): string {
+  const url = new URL(targetUrl);
+  // Remove leading slash from pathname
+  return url.pathname.replace(/^\//, "");
+}
+
+/**
+ * Checks if an endpoint matches any of the allowed endpoint patterns.
+ *
+ * @param endpoint the endpoint to check (path without leading slash).
+ * @param patterns the allowed endpoint patterns (glob-style).
+ * @returns whether the endpoint is allowed.
+ */
+export function isAllowedEndpoint(
+  endpoint: string,
+  patterns: string[],
+): boolean {
+  // Empty array means all endpoints are allowed (backwards compatibility)
+  if (patterns.length === 0) {
+    return true;
+  }
+  return createUrlMatcher(patterns)(endpoint);
 }
 
 function getFalKey(): string | undefined {
@@ -53,82 +200,187 @@ function getFalKey(): string | undefined {
   return undefined;
 }
 
-const EXCLUDED_HEADERS = ['content-length', 'content-encoding'];
-
 /**
- * A request handler that proxies the request to the fal-serverless
- * endpoint. This is useful so client-side calls to the fal-serverless endpoint
+ * A request handler that proxies the request to the fal API
+ * endpoint. This is useful so client-side calls to the fal endpoint
  * can be made without CORS issues and the correct credentials can be added
  * effortlessly.
  *
  * @param behavior the request proxy behavior.
+ * @param config the proxy configuration. Can be a partial config (will be resolved internally)
+ *               or a pre-resolved config from `resolveProxyConfig` to avoid per-request warnings.
  * @returns Promise<any> the promise that will be resolved once the request is done.
  */
 export async function handleRequest<ResponseType>(
-  behavior: ProxyBehavior<ResponseType>
+  behavior: ProxyBehavior<ResponseType>,
+  config: Partial<ProxyConfig> | ProxyConfig = {},
 ) {
   const targetUrl = singleHeaderValue(behavior.getHeader(TARGET_URL_HEADER));
   if (!targetUrl) {
-    return behavior.respondWith(400, `Missing the ${TARGET_URL_HEADER} header`);
+    return behavior.respondWith(400, "Invalid request");
   }
 
-  const urlHost = new URL(targetUrl).host;
-  if (!FAL_URL_REG_EXP.test(urlHost)) {
-    return behavior.respondWith(412, `Invalid ${TARGET_URL_HEADER} header`);
+  // Check if config is already resolved (has all required fields with non-undefined values)
+  const isResolved =
+    config.isAuthenticated !== undefined &&
+    config.resolveFalAuth !== undefined &&
+    config.allowUnauthorizedRequests !== undefined &&
+    config.allowedUrlPatterns !== undefined;
+  const resolvedConfig = isResolved
+    ? (config as ProxyConfig)
+    : applyProxyConfig(config);
+
+  let requestBodyPromise: Promise<string | undefined> | undefined;
+  const readRequestBody = () =>
+    (requestBodyPromise ??= behavior.getRequestBody());
+  const behaviorWithCachedBody: ProxyBehavior<ResponseType> = {
+    id: behavior.id,
+    method: behavior.method,
+    respondWith: (status, data) => behavior.respondWith(status, data),
+    sendResponse: (response) => behavior.sendResponse(response),
+    getHeaders: () => behavior.getHeaders(),
+    getHeader: (name) => behavior.getHeader(name),
+    sendHeader: (name, value) => behavior.sendHeader(name, value),
+    getRequestBody: readRequestBody,
+    resolveApiKey: behavior.resolveApiKey?.bind(behavior),
+  };
+  let authenticationPromise: Promise<boolean> | undefined;
+  const authenticate = () =>
+    (authenticationPromise ??= (async () =>
+      (await resolvedConfig.isAuthenticated?.(behaviorWithCachedBody)) ??
+      false)());
+
+  const target = parseTargetUrl(targetUrl);
+  if (!target) {
+    return behavior.respondWith(400, "Invalid request");
+  }
+  const serviceHosts = new Set(
+    (resolvedConfig.serviceHosts ?? ["wma.fal.run"]).map((host) =>
+      host.toLowerCase(),
+    ),
+  );
+  const isServiceHost =
+    target.protocol === "https:" && serviceHosts.has(target.host.toLowerCase());
+
+  const urlToValidate = `${target.host}${target.pathname}${target.search}`;
+  if (
+    !isServiceHost &&
+    !isAllowedUrl(urlToValidate, resolvedConfig.allowedUrlPatterns)
+  ) {
+    return behavior.respondWith(400, "Invalid request");
   }
 
-  const falKey = behavior.resolveApiKey
-    ? await behavior.resolveApiKey()
-    : getFalKey();
-  if (!falKey) {
-    return behavior.respondWith(401, 'Missing fal.ai credentials');
+  const method = behavior.method?.toUpperCase();
+  if (isServiceHost) {
+    if (method !== "POST") {
+      return behavior.respondWith(400, "Invalid request");
+    }
+    const path = normalizeServicePath(target);
+    const isAppScoped =
+      path !== undefined && SERVICE_APP_SCOPED_PATHS.has(path);
+    if (
+      !isAppScoped &&
+      (path === undefined || !SERVICE_SESSION_SCOPED_PATHS.has(path))
+    ) {
+      return behavior.respondWith(400, "Invalid request");
+    }
+
+    const allowedEndpoints = resolvedConfig.allowedEndpoints ?? [];
+    if (isAppScoped && allowedEndpoints.length > 0) {
+      const isAuthenticated = await authenticate();
+      if (!isAuthenticated && !resolvedConfig.allowUnauthorizedRequests) {
+        return behavior.respondWith(401, "Unauthorized");
+      }
+      const appId = appIdFromRequestBody(await readRequestBody());
+      if (!appId || !isAllowedEndpoint(appId, allowedEndpoints)) {
+        return behavior.respondWith(400, "Invalid request");
+      }
+    }
+  } else if (!isFalAiDomain(target.href)) {
+    // Normal app-serving URLs use the path-based endpoint check, whatever the method. Queue
+    // request routes do not carry the endpoint path, so they are checked by the app they address.
+    const endpoint = getEndpoint(target.href);
+    const allowedEndpoints = resolvedConfig.allowedEndpoints ?? [];
+    const isAllowed =
+      isAllowedEndpoint(endpoint, allowedEndpoints) ||
+      (method !== "POST" && isAllowedQueueRequest(endpoint, allowedEndpoints));
+    if (!isAllowed) {
+      return behavior.respondWith(400, "Invalid request");
+    }
+  }
+
+  const isAuthenticated = await authenticate();
+  if (!isAuthenticated && !resolvedConfig.allowUnauthorizedRequests) {
+    return behavior.respondWith(401, "Unauthorized");
+  }
+
+  const authorization =
+    (await resolvedConfig.resolveFalAuth?.(behaviorWithCachedBody)) ??
+    (await behavior.resolveApiKey?.());
+  if (!authorization) {
+    return behavior.respondWith(401, "Unauthorized");
   }
 
   // pass over headers prefixed with x-fal-*
   const headers: Record<string, HeaderValue> = {};
   Object.keys(behavior.getHeaders()).forEach((key) => {
-    if (key.toLowerCase().startsWith('x-fal-')) {
+    if (key.toLowerCase().startsWith("x-fal-")) {
       headers[key.toLowerCase()] = behavior.getHeader(key);
     }
   });
 
-  const proxyUserAgent = `@fal-ai/serverless-proxy/${behavior.id}`;
-  const userAgent = singleHeaderValue(behavior.getHeader('user-agent'));
-  const res = await fetch(targetUrl, {
+  const proxyUserAgent = getProxyUserAgent(behavior.id);
+  const userAgent = singleHeaderValue(behavior.getHeader("user-agent"));
+  const res = await fetchWithBackupDomain(fetch, target.href, {
     method: behavior.method,
+    // A redirect location is upstream-controlled: following it would fetch an unvalidated URL
+    // from this server's network, with the credentials attached when it stays on the same origin.
+    redirect: "manual",
     headers: {
       ...headers,
-      authorization:
-        singleHeaderValue(behavior.getHeader('authorization')) ??
-        `Key ${falKey}`,
-      accept: 'application/json',
-      'content-type': 'application/json',
-      'user-agent': userAgent,
-      'x-fal-client-proxy': proxyUserAgent,
+      authorization,
+      accept: "application/json",
+      "content-type": "application/json",
+      "user-agent": userAgent,
+      "x-fal-client-proxy": proxyUserAgent,
     } as HeadersInit,
     body:
-      behavior.method?.toUpperCase() === 'GET'
+      behavior.method?.toUpperCase() === "GET"
         ? undefined
-        : await behavior.getBody(),
+        : await readRequestBody(),
   });
 
-  // copy headers from fal to the proxied response
+  if (
+    res.type === "opaqueredirect" ||
+    (res.status >= 300 && res.status < 400 && res.status !== 304)
+  ) {
+    await res.body?.cancel();
+    return behavior.respondWith(502, "Bad gateway");
+  }
+
+  // Rebuild the response so every adapter, including the ones that pass the upstream response
+  // straight through, only exposes the forwarded headers.
+  const responseHeaders = new Headers();
   res.headers.forEach((value, key) => {
-    if (!EXCLUDED_HEADERS.includes(key.toLowerCase())) {
-      behavior.sendHeader(key, value);
+    if (isForwardedResponseHeader(key)) {
+      responseHeaders.set(key, value);
     }
   });
+  responseHeaders.set("cache-control", "no-store");
+  responseHeaders.set("x-content-type-options", "nosniff");
+  responseHeaders.forEach((value, key) => behavior.sendHeader(key, value));
 
-  if (res.headers.get('content-type')?.includes('application/json')) {
-    const data = await res.json();
-    return behavior.respondWith(res.status, data);
-  }
-  const data = await res.text();
-  return behavior.respondWith(res.status, data);
+  return behavior.sendResponse(
+    new Response(res.body, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: responseHeaders,
+    }),
+  );
 }
 
 export function fromHeaders(
-  headers: Headers
+  headers: Headers,
 ): Record<string, string | string[]> {
   // TODO once Header.entries() is available, use that instead
   // Object.fromEntries(headers.entries());
@@ -138,3 +390,7 @@ export function fromHeaders(
   });
   return result;
 }
+
+export const responsePassthrough = (res: Response) => Promise.resolve(res);
+
+export const resolveApiKeyFromEnv = () => Promise.resolve(getFalKey());

@@ -3,17 +3,18 @@
  *
  * **Note:** This is a simplified version of the `RequestConfig` type from the
  * `fetch` API. It contains only the properties that are relevant for the
- * `fal-serverless` client. It also works around the fact that the `fetch` API
- * `Request` does not support mutability, its clone method has critical limitations
+ * fal client. It also works around the fact that the `fetch` API `Request`
+ * does not support mutability, its clone method has critical limitations
  * to our use case.
  */
 export type RequestConfig = {
   url: string;
+  method: string;
   headers?: Record<string, string | string[]>;
 };
 
 export type RequestMiddleware = (
-  request: RequestConfig
+  request: RequestConfig,
 ) => Promise<RequestConfig>;
 
 /**
@@ -25,27 +26,69 @@ export type RequestMiddleware = (
 export function withMiddleware(
   ...middlewares: RequestMiddleware[]
 ): RequestMiddleware {
-  return (config) =>
-    middlewares.reduce(
-      (configPromise, middleware) =>
-        configPromise.then((req) => middleware(req)),
-      Promise.resolve(config)
-    );
+  const isDefined = (middleware: RequestMiddleware): boolean =>
+    typeof middleware === "function";
+
+  return async (config: RequestConfig) => {
+    let currentConfig = { ...config };
+    for (const middleware of middlewares.filter(isDefined)) {
+      currentConfig = await middleware(currentConfig);
+    }
+    return currentConfig;
+  };
 }
+
+/**
+ * Runtime information passed to a user-provided {@link ProxyRuntimeGate}
+ * predicate so it can decide whether the proxy middleware should apply.
+ */
+export type ProxyRuntimeEnv = {
+  isBrowser: boolean;
+};
+
+/**
+ * Controls when the proxy middleware applies:
+ * - `"browser"` — only when a DOM `window` is available (default).
+ * - `"always"` — in every runtime (Node, Electron, Bun, workers, etc.).
+ * - A predicate receiving {@link ProxyRuntimeEnv} — full control per call.
+ */
+export type ProxyRuntimeGate =
+  | "browser"
+  | "always"
+  | ((env: ProxyRuntimeEnv) => boolean);
 
 export type RequestProxyConfig = {
   targetUrl: string;
+  when?: ProxyRuntimeGate;
 };
 
-export const TARGET_URL_HEADER = 'x-fal-target-url';
+export const TARGET_URL_HEADER = "x-fal-target-url";
+
+function shouldProxy(when: ProxyRuntimeGate | undefined): boolean {
+  const env: ProxyRuntimeEnv = {
+    isBrowser:
+      typeof window !== "undefined" && typeof window.document !== "undefined",
+  };
+  if (typeof when === "function") {
+    return when(env);
+  }
+  if (when === "always") {
+    return true;
+  }
+  return env.isBrowser;
+}
 
 export function withProxy(config: RequestProxyConfig): RequestMiddleware {
-  // when running on the server, we don't need to proxy the request
-  if (typeof window === 'undefined') {
-    return (requestConfig) => Promise.resolve(requestConfig);
-  }
-  return (requestConfig) =>
-    Promise.resolve({
+  return (requestConfig) => {
+    // if x-fal-target-url is already set, we skip it to keep the middleware
+    // re-entrant (e.g. when composed with other proxy-like middlewares)
+    if (requestConfig.headers && TARGET_URL_HEADER in requestConfig.headers) {
+      return Promise.resolve(requestConfig);
+    }
+    if (!shouldProxy(config.when)) {
+      return Promise.resolve(requestConfig);
+    }
+    return Promise.resolve({
       ...requestConfig,
       url: config.targetUrl,
       headers: {
@@ -53,4 +96,5 @@ export function withProxy(config: RequestProxyConfig): RequestMiddleware {
         [TARGET_URL_HEADER]: requestConfig.url,
       },
     });
+  };
 }

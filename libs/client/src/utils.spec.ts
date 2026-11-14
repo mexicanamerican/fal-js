@@ -1,72 +1,71 @@
-import uuid from 'uuid-random';
-import { ensureAppIdFormat, isUUIDv4, parseAppId } from './utils';
+import { ensureEndpointIdFormat, isValidUrl, parseEndpointId } from "./utils";
 
-describe('The utils test suite', () => {
-  it('should match a valid v4 uuid', () => {
-    const id = uuid();
-    expect(isUUIDv4(id)).toBe(true);
+describe("The utils test suite", () => {
+  it("shoud match a current appOwner/appId format", () => {
+    const id = "fal-ai/fast-sdxl";
+    expect(ensureEndpointIdFormat(id)).toBe(id);
   });
 
-  it('should not match invalid v4 id', () => {
-    const id = 'e726b886-e2c2-11ed-b5ea-0242ac120002';
-    expect(isUUIDv4(id)).toBe(false);
+  it("shoud match a current appOwner/appId/path format", () => {
+    const id = "fal-ai/fast-sdxl/image-to-image";
+    expect(ensureEndpointIdFormat(id)).toBe(id);
   });
 
-  it('shoud match match a legacy appOwner-appId format', () => {
-    const id = '12345-abcde-fgh';
-    expect(ensureAppIdFormat(id)).toBe('12345/abcde-fgh');
+  it("should throw on an invalid app id format", () => {
+    const id = "just-an-id";
+    expect(() => ensureEndpointIdFormat(id)).toThrowError();
   });
 
-  it('shoud match a current appOwner/appId format', () => {
-    const id = 'fal-ai/fast-sdxl';
-    expect(ensureAppIdFormat(id)).toBe(id);
+  it("should reject URLs that failed validation instead of passing them through", () => {
+    // An http:// fal URL fails isValidUrl (https-only); slipping it through as an "endpoint id"
+    // would build https://fal.run/http://… — a silently mangled 404. Reject loudly instead.
+    expect(() =>
+      ensureEndpointIdFormat("http://fal.run/fal-ai/flux"),
+    ).toThrowError(/https/);
+    expect(() =>
+      ensureEndpointIdFormat("https://evil.example/fal-ai/flux"),
+    ).toThrowError(/https/);
   });
 
-  it('shoud match a current appOwner/appId/path format', () => {
-    const id = 'fal-ai/fast-sdxl/image-to-image';
-    expect(ensureAppIdFormat(id)).toBe(id);
-  });
-
-  it('should throw on an invalid app id format', () => {
-    const id = 'just-an-id';
-    expect(() => ensureAppIdFormat(id)).toThrowError();
-  });
-
-  it('should parse a legacy app id', () => {
-    const id = '12345-abcde-fgh';
-    const parsed = parseAppId(id);
+  it("should parse a current app id", () => {
+    const id = "fal-ai/fast-sdxl";
+    const parsed = parseEndpointId(id);
     expect(parsed).toEqual({
-      owner: '12345',
-      alias: 'abcde-fgh',
+      owner: "fal-ai",
+      alias: "fast-sdxl",
     });
   });
 
-  it('should parse a current app id', () => {
-    const id = 'fal-ai/fast-sdxl';
-    const parsed = parseAppId(id);
+  it("should parse a current app id with path", () => {
+    const id = "fal-ai/fast-sdxl/image-to-image";
+    const parsed = parseEndpointId(id);
     expect(parsed).toEqual({
-      owner: 'fal-ai',
-      alias: 'fast-sdxl',
+      owner: "fal-ai",
+      alias: "fast-sdxl",
+      path: "image-to-image",
     });
   });
 
-  it('should parse a current app id with path', () => {
-    const id = 'fal-ai/fast-sdxl/image-to-image';
-    const parsed = parseAppId(id);
+  it("should parse a current app id with namespace", () => {
+    const id = "workflows/fal-ai/fast-sdxl";
+    const parsed = parseEndpointId(id);
     expect(parsed).toEqual({
-      owner: 'fal-ai',
-      alias: 'fast-sdxl',
-      path: 'image-to-image',
+      owner: "fal-ai",
+      alias: "fast-sdxl",
+      namespace: "workflows",
     });
   });
 
-  it('should parse a current app id with namespace', () => {
-    const id = 'workflows/fal-ai/fast-sdxl';
-    const parsed = parseAppId(id);
-    expect(parsed).toEqual({
-      owner: 'fal-ai',
-      alias: 'fast-sdxl',
-      namespace: 'workflows',
-    });
+  it("accepts only HTTPS URLs on actual fal domains", () => {
+    expect(isValidUrl("https://fal.run/fal-ai/flux")).toBe(true);
+    expect(isValidUrl("https://queue.fal.run/fal-ai/flux")).toBe(true);
+    expect(isValidUrl("https://api.fal.ai/models")).toBe(true);
+    expect(isValidUrl("https://notfal.run/steal")).toBe(false);
+    expect(isValidUrl("https://fal.run.attacker.example/steal")).toBe(false);
+    expect(isValidUrl("http://fal.run/fal-ai/flux")).toBe(false);
+    // The default :443 normalizes away; any surviving explicit port is another listener and
+    // credentials must not follow a fal hostname to it.
+    expect(isValidUrl("https://fal.run:443/fal-ai/flux")).toBe(true);
+    expect(isValidUrl("https://fal.run:8443/fal-ai/flux")).toBe(false);
   });
 });

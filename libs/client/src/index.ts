@@ -1,14 +1,108 @@
-export { config, getConfig } from './config';
-export { queue, run, subscribe } from './function';
-export { withMiddleware, withProxy } from './middleware';
-export type { RequestMiddleware } from './middleware';
-export { realtimeImpl as realtime } from './realtime';
-export { ApiError, ValidationError } from './response';
-export type { ResponseHandler } from './response';
-export { storageImpl as storage } from './storage';
-export { stream } from './streaming';
+import { createFalClient, type FalClient } from "./client";
+import { Config } from "./config";
+import { StreamOptions } from "./streaming";
+import { EndpointType, InputType } from "./types/client";
+import { RunOptions } from "./types/common";
+
+export type { TokenProvider } from "./auth";
+export { createFalClient, type FalClient } from "./client";
+export type { ProxyUrlConfig } from "./config";
+export { withMiddleware, withProxy } from "./middleware";
+export type {
+  ProxyRuntimeEnv,
+  ProxyRuntimeGate,
+  RequestMiddleware,
+  RequestProxyConfig,
+} from "./middleware";
+export type { PollBackoff, QueueClient } from "./queue";
+export type {
+  RealtimeClient,
+  RealtimeConnection,
+  RealtimeConnectionHandler,
+} from "./realtime";
+export {
+  defineRealtimeExtension,
+  type AnyRealtimeExtension,
+  type IceGatheringOptions,
+  type IceGatheringResult,
+  type ManagedRealtimeSession,
+  type RealtimeDiagnostic,
+  type RealtimeExtension,
+  type RealtimeExtensionContext,
+  type RealtimeExtensionOptions,
+  type RealtimeExtensionSession,
+  // Exported from the root because `open()`'s own signature references it: without this, a caller
+  // importing only from "@fal-ai/client" could pass `onState`/`onDiagnostic`/`onMedia` but could not
+  // name the type of the handler they were writing.
+  type RealtimeOpenOptions,
+  type RealtimeSession,
+  type RealtimeState,
+} from "./realtime/extension";
+export { ApiError, ValidationError } from "./response";
+export type { ResponseHandler } from "./response";
+export { isRetryableError } from "./retry";
+export type { RetryOptions } from "./retry";
+export {
+  MULTIPART_THRESHOLD,
+  MultipartUploadError,
+  type MultipartOptions,
+  type StorageACL,
+  type StorageACLRule,
+  type StorageClient,
+  type StorageSettings,
+  type UploadOptions,
+  type UploadProgress,
+} from "./storage";
+export type { FalStream, StreamingClient } from "./streaming";
+export type { OutputType } from "./types/client";
+export * from "./types/common";
 export type {
   QueueStatus,
   ValidationErrorInfo,
   WebHookResponse,
-} from './types';
+} from "./types/common";
+export { parseEndpointId } from "./utils";
+
+type SingletonFalClient = {
+  config(config: Config): void;
+} & FalClient;
+
+/**
+ * Creates a singleton instance of the client. This is useful as a compatibility
+ * layer for existing code that uses the clients version prior to 1.0.0.
+ */
+export const fal: SingletonFalClient = (function createSingletonFalClient() {
+  let currentInstance: FalClient = createFalClient();
+  return {
+    config(config: Config) {
+      currentInstance = createFalClient(config);
+    },
+    get queue() {
+      return currentInstance.queue;
+    },
+    get realtime() {
+      return currentInstance.realtime;
+    },
+    get storage() {
+      return currentInstance.storage;
+    },
+    get streaming() {
+      return currentInstance.streaming;
+    },
+    run<Id extends EndpointType>(id: Id, options: RunOptions<InputType<Id>>) {
+      return currentInstance.run<Id>(id, options);
+    },
+    subscribe<Id extends EndpointType>(
+      endpointId: Id,
+      options: RunOptions<InputType<Id>>,
+    ) {
+      return currentInstance.subscribe<Id>(endpointId, options);
+    },
+    stream<Id extends EndpointType>(
+      endpointId: Id,
+      options: StreamOptions<InputType<Id>>,
+    ) {
+      return currentInstance.stream<Id>(endpointId, options);
+    },
+  } satisfies SingletonFalClient;
+})();

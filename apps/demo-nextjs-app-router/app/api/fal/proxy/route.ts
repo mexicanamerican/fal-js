@@ -1,3 +1,3 @@
-import { route } from '@fal-ai/serverless-proxy/nextjs';
+import { createRouteHandler } from "@fal-ai/server-proxy/nextjs";
 
-export const { GET, POST } = route;
+export const { GET, POST, PUT } = createRouteHandler();

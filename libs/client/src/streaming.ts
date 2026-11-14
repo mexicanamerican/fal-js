@@ -1,42 +1,109 @@
-import { createParser } from 'eventsource-parser';
-import { getTemporaryAuthToken } from './auth';
-import { buildUrl } from './function';
-import { ApiError, defaultResponseHandler } from './response';
-import { storageImpl } from './storage';
+import { createParser } from "eventsource-parser";
+import { type TokenProvider, getTemporaryAuthToken } from "./auth";
+import { fetchWithBackupDomain } from "./backup-domain";
+import { RequiredConfig } from "./config";
+import { buildTagsHeaders } from "./headers";
+import { buildUrl, dispatchRequest } from "./request";
+import { ApiError, defaultResponseHandler } from "./response";
+import { type StorageClient } from "./storage";
+import { EndpointType, InputType, OutputType } from "./types/client";
+import {
+  ensureEndpointIdFormat,
+  isValidUrl,
+  resolveEndpointPath,
+} from "./utils";
+
+export type StreamingConnectionMode = "client" | "server";
+
+const CONTENT_TYPE_EVENT_STREAM = "text/event-stream";
 
 /**
  * The stream API options. It requires the API input and also
  * offers configuration options.
  */
-type StreamOptions<Input> = {
+export type StreamOptions<Input> = {
+  /**
+   * The endpoint URL. If not provided, it will be generated from the
+   * `endpointId` and the `queryParams`.
+   */
+  readonly url?: string;
+
   /**
    * The API input payload.
    */
-  input: Input;
+  readonly input?: Input;
+
+  /**
+   * The query parameters to be sent with the request.
+   */
+  readonly queryParams?: Record<string, string>;
 
   /**
    * The maximum time interval in milliseconds between stream chunks. Defaults to 15s.
    */
-  timeout?: number;
+  readonly timeout?: number;
 
   /**
    * Whether it should auto-upload File-like types to fal's storage
    * or not.
    */
-  autoUpload?: boolean;
+  readonly autoUpload?: boolean;
+
+  /**
+   * The HTTP method, defaults to `post`;
+   */
+  readonly method?: "get" | "post" | "put" | "delete" | string;
+
+  /**
+   * The content type the client accepts as response.
+   * By default this is set to `text/event-stream`.
+   */
+  readonly accept?: string;
+
+  /**
+   * The streaming connection mode. This is used to determine
+   * whether the streaming will be done from the browser itself (client)
+   * or through your own server, either when running on NodeJS or when
+   * using a proxy that supports streaming.
+   *
+   * It defaults to `server`. Set to `client` if your server proxy doesn't
+   * support streaming.
+   */
+  readonly connectionMode?: StreamingConnectionMode;
+
+  /**
+   * The signal to abort the request.
+   */
+  readonly signal?: AbortSignal;
+
+  /**
+   * A custom token provider function. Only used when `connectionMode` is `"client"`.
+   * When provided, this function will be used to fetch authentication tokens
+   * instead of the default internal token fetching mechanism.
+   */
+  readonly tokenProvider?: TokenProvider;
+
+  /**
+   * Tags to attribute the request's usage and cost to your own dimensions.
+   *
+   * @see RunOptions.tags
+   */
+  readonly tags?: Record<string, string>;
 };
 
 const EVENT_STREAM_TIMEOUT = 15 * 1000;
 
-type FalStreamEventType = 'message' | 'error' | 'done';
+type FalStreamEventType = "data" | "error" | "done";
 
-type EventHandler = (event: any) => void;
+type EventHandler<T = any> = (event: T) => void;
 
 /**
  * The class representing a streaming response. With t
  */
-class FalStream<Input, Output> {
+export class FalStream<Input, Output> {
   // properties
+  config: RequiredConfig;
+  endpointId: string;
   url: string;
   options: StreamOptions<Input>;
 
@@ -48,44 +115,128 @@ class FalStream<Input, Output> {
   private currentData: Output | undefined = undefined;
   private lastEventTimestamp = 0;
   private streamClosed = false;
+  private _requestId: string | null = null;
   private donePromise: Promise<Output>;
 
-  constructor(url: string, options: StreamOptions<Input>) {
-    this.url = url;
+  private abortController = new AbortController();
+
+  constructor(
+    endpointId: string,
+    config: RequiredConfig,
+    options: StreamOptions<Input>,
+  ) {
+    this.endpointId = endpointId;
+    this.config = config;
+    this.url =
+      options.url ??
+      buildUrl(endpointId, {
+        path: resolveEndpointPath(endpointId, undefined, "/stream"),
+        query: options.queryParams,
+      });
     this.options = options;
     this.donePromise = new Promise<Output>((resolve, reject) => {
       if (this.streamClosed) {
         reject(
           new ApiError({
-            message: 'Streaming connection is already closed.',
+            message: "Streaming connection is already closed.",
             status: 400,
             body: undefined,
-          })
+            requestId: this._requestId || undefined,
+          }),
         );
       }
-      this.on('done', (data) => {
+      this.signal.addEventListener("abort", () => {
+        resolve(this.currentData ?? ({} as Output));
+      });
+      this.on("done", (data) => {
         this.streamClosed = true;
         resolve(data);
       });
-      this.on('error', (error) => {
+      this.on("error", (error) => {
         this.streamClosed = true;
         reject(error);
       });
     });
+    // if a abort signal was passed, sync it with the internal one
+    if (options.signal) {
+      options.signal.addEventListener("abort", () => {
+        this.abortController.abort();
+      });
+    }
+
+    // start the streaming request
     this.start().catch(this.handleError);
   }
 
   private start = async () => {
+    const { endpointId, options } = this;
+    const {
+      input,
+      method = "post",
+      connectionMode = "server",
+      tokenProvider,
+    } = options;
     try {
-      const response = await fetch(this.url, {
-        method: 'POST',
-        headers: {
-          accept: 'text/event-stream',
-          'content-type': 'application/json',
+      if (connectionMode === "client") {
+        // if we are in the browser, we need to get a temporary token
+        // to authenticate the request
+        // A full fal URL is a valid endpoint here, exactly as buildUrl accepts it — the token
+        // scope is then the URL itself, which a custom tokenProvider resolves. Only bare ids go
+        // through the endpoint-format check (which throws on scheme-bearing strings).
+        const appId = isValidUrl(endpointId)
+          ? endpointId
+          : ensureEndpointIdFormat(endpointId);
+        const resolvedPath =
+          resolveEndpointPath(endpointId, undefined, "/stream") ?? "";
+        const fetchToken = tokenProvider
+          ? () => tokenProvider(`${appId}${resolvedPath}`)
+          : () => {
+              console.warn(
+                "[fal.stream] Using the default token provider is deprecated. " +
+                  'Please provide a `tokenProvider` function when using `connectionMode: "client"`. ' +
+                  "See https://docs.fal.ai/fal-client/authentication for more information.",
+              );
+              return getTemporaryAuthToken(endpointId, this.config);
+            };
+
+        const token = await fetchToken();
+        const { fetch } = this.config;
+        const parsedUrl = new URL(this.url);
+        parsedUrl.searchParams.set("fal_jwt_token", token);
+        const response = await fetchWithBackupDomain(
+          fetch,
+          parsedUrl.toString(),
+          {
+            method: method.toUpperCase(),
+            headers: {
+              accept: options.accept ?? CONTENT_TYPE_EVENT_STREAM,
+              "content-type": "application/json",
+              ...buildTagsHeaders(options.tags),
+            },
+            body: input && method !== "get" ? JSON.stringify(input) : undefined,
+            signal: this.abortController.signal,
+          },
+        );
+        this._requestId = response.headers.get("x-fal-request-id");
+        return await this.handleResponse(response);
+      }
+      return await dispatchRequest({
+        method: method.toUpperCase(),
+        targetUrl: this.url,
+        input,
+        config: this.config,
+        options: {
+          headers: {
+            accept: options.accept ?? CONTENT_TYPE_EVENT_STREAM,
+            ...buildTagsHeaders(options.tags),
+          },
+          responseHandler: async (response) => {
+            this._requestId = response.headers.get("x-fal-request-id");
+            return await this.handleResponse(response);
+          },
+          signal: this.abortController.signal,
         },
-        body: JSON.stringify(this.options.input),
       });
-      this.handleResponse(response);
     } catch (error) {
       this.handleError(error);
     }
@@ -98,7 +249,7 @@ class FalStream<Input, Output> {
         // so the exception gets converted to ApiError correctly
         await defaultResponseHandler(response);
       } catch (error) {
-        this.emit('error', error);
+        this.emit("error", error);
       }
       return;
     }
@@ -106,29 +257,56 @@ class FalStream<Input, Output> {
     const body = response.body;
     if (!body) {
       this.emit(
-        'error',
+        "error",
         new ApiError({
-          message: 'Response body is empty.',
+          message: "Response body is empty.",
           status: 400,
           body: undefined,
-        })
+          requestId: this._requestId || undefined,
+        }),
       );
       return;
     }
-    const decoder = new TextDecoder('utf-8');
+
+    const isEventStream = (
+      response.headers.get("content-type") ?? ""
+    ).startsWith(CONTENT_TYPE_EVENT_STREAM);
+    // any response that is not a text/event-stream will be handled as a binary stream
+    if (!isEventStream) {
+      const reader = body.getReader();
+      const emitRawChunk = () => {
+        reader.read().then(({ done, value }) => {
+          if (done) {
+            this.emit("done", this.currentData);
+            return;
+          }
+          this.buffer.push(value as Output);
+          this.currentData = value as Output;
+          this.emit("data", value);
+          emitRawChunk();
+        });
+      };
+      emitRawChunk();
+      return;
+    }
+
+    const decoder = new TextDecoder("utf-8");
     const reader = response.body.getReader();
 
     const parser = createParser((event) => {
-      if (event.type === 'event') {
+      if (event.type === "event") {
         const data = event.data;
 
         try {
           const parsedData = JSON.parse(data);
           this.buffer.push(parsedData);
           this.currentData = parsedData;
-          this.emit('message', parsedData);
+          this.emit("data", parsedData);
+
+          // also emit 'message'for backwards compatibility
+          this.emit("message" as any, parsedData);
         } catch (e) {
-          this.emit('error', e);
+          this.emit("error", e);
         }
       }
     });
@@ -143,18 +321,19 @@ class FalStream<Input, Output> {
 
       if (Date.now() - this.lastEventTimestamp > timeout) {
         this.emit(
-          'error',
+          "error",
           new ApiError({
             message: `Event stream timed out after ${(timeout / 1000).toFixed(0)} seconds with no messages.`,
             status: 408,
-          })
+            requestId: this._requestId || undefined,
+          }),
         );
       }
 
       if (!done) {
         readPartialResponse().catch(this.handleError);
       } else {
-        this.emit('done', this.currentData);
+        this.emit("done", this.currentData);
       }
     };
 
@@ -163,14 +342,22 @@ class FalStream<Input, Output> {
   };
 
   private handleError = (error: any) => {
+    // In case AbortError is thrown but the signal is marked as aborted
+    // it means the user called abort() and we should not emit an error
+    // as it's expected behavior
+    // See note on: https://developer.mozilla.org/en-US/docs/Web/API/AbortController/abort
+    if (error.name === "AbortError" || this.signal.aborted) {
+      return;
+    }
     const apiError =
       error instanceof ApiError
         ? error
         : new ApiError({
-            message: error.message ?? 'An unknown error occurred',
+            message: error.message ?? "An unknown error occurred",
             status: 500,
+            requestId: this._requestId || undefined,
           });
-    this.emit('error', apiError);
+    this.emit("error", apiError);
     return;
   };
 
@@ -191,9 +378,9 @@ class FalStream<Input, Output> {
   async *[Symbol.asyncIterator]() {
     let running = true;
     const stopAsyncIterator = () => (running = false);
-    this.on('error', stopAsyncIterator);
-    this.on('done', stopAsyncIterator);
-    while (running) {
+    this.on("error", stopAsyncIterator);
+    this.on("done", stopAsyncIterator);
+    while (running || this.buffer.length > 0) {
       const data = this.buffer.shift();
       if (data) {
         yield data;
@@ -216,35 +403,83 @@ class FalStream<Input, Output> {
    * @returns the promise that resolves when the request is done.
    */
   public done = async () => this.donePromise;
+
+  /**
+   * Aborts the streaming request.
+   *
+   * **Note:** This method is noop in case the request is already done.
+   *
+   * @param reason optional cause for aborting the request.
+   */
+  public abort = (reason?: string | Error) => {
+    if (!this.streamClosed) {
+      this.abortController.abort(reason);
+    }
+  };
+
+  /**
+   * Gets the `AbortSignal` instance that can be used to listen for abort events.
+   *
+   * **Note:** this signal is internal to the `FalStream` instance. If you pass your
+   * own abort signal, the `FalStream` will listen to it and abort it appropriately.
+   *
+   * @returns the `AbortSignal` instance.
+   * @see https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal
+   */
+  public get signal() {
+    return this.abortController.signal;
+  }
+
+  /**
+   * Gets the request id of the streaming request.
+   *
+   * @returns the request id.
+   */
+  public get requestId() {
+    return this._requestId;
+  }
 }
 
 /**
- * Calls a fal app that supports streaming and provides a streaming-capable
- * object as a result, that can be used to get partial results through either
- * `AsyncIterator` or through an event listener.
- *
- * @param appId the app id, e.g. `fal-ai/llavav15-13b`.
- * @param options the request options, including the input payload.
- * @returns the `FalStream` instance.
+ * The streaming client interface.
  */
-export async function stream<Input = Record<string, any>, Output = any>(
-  appId: string,
-  options: StreamOptions<Input>
-): Promise<FalStream<Input, Output>> {
-  const token = await getTemporaryAuthToken(appId);
-  const url = buildUrl(appId, { path: '/stream' });
+export interface StreamingClient {
+  /**
+   * Calls a fal app that supports streaming and provides a streaming-capable
+   * object as a result, that can be used to get partial results through either
+   * `AsyncIterator` or through an event listener.
+   *
+   * @param endpointId the endpoint id, e.g. `fal-ai/llavav15-13b`.
+   * @param options the request options, including the input payload.
+   * @returns the `FalStream` instance.
+   */
+  stream<Id extends EndpointType>(
+    endpointId: Id,
+    options: StreamOptions<InputType<Id>>,
+  ): Promise<FalStream<InputType<Id>, OutputType<Id>>>;
+}
 
-  const input =
-    options.input && options.autoUpload !== false
-      ? await storageImpl.transformInput(options.input)
-      : options.input;
+type StreamingClientDependencies = {
+  config: RequiredConfig;
+  storage: StorageClient;
+};
 
-  const queryParams = new URLSearchParams({
-    fal_jwt_token: token,
-  });
-
-  return new FalStream<Input, Output>(`${url}?${queryParams}`, {
-    ...options,
-    input: input as Input,
-  });
+export function createStreamingClient({
+  config,
+  storage,
+}: StreamingClientDependencies): StreamingClient {
+  return {
+    async stream<Id extends EndpointType>(
+      endpointId: Id,
+      options: StreamOptions<InputType<Id>>,
+    ) {
+      const input = options.input
+        ? await storage.transformInput(options.input)
+        : undefined;
+      return new FalStream<InputType<Id>, OutputType<Id>>(endpointId, config, {
+        ...options,
+        input: input as InputType<Id>,
+      });
+    },
+  };
 }

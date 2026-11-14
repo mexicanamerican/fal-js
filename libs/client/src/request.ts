@@ -1,51 +1,191 @@
-import { getConfig } from './config';
-import { getUserAgent, isBrowser } from './runtime';
+import { fetchWithBackupDomain } from "./backup-domain";
+import { RequiredConfig } from "./config";
+import { ResponseHandler } from "./response";
+import {
+  calculateBackoffDelay,
+  isRetryableError,
+  type RetryOptions,
+} from "./retry";
+import { getUserAgent, isBrowser } from "./runtime";
+import { RunOptions, UrlOptions } from "./types/common";
+import { ensureEndpointIdFormat, isValidUrl, sleep } from "./utils";
 
 const isCloudflareWorkers =
-  typeof navigator !== 'undefined' &&
-  navigator?.userAgent === 'Cloudflare-Workers';
+  typeof navigator !== "undefined" &&
+  navigator?.userAgent === "Cloudflare-Workers";
+
+type RequestOptions = {
+  responseHandler?: ResponseHandler<any>;
+  /**
+   * Retry configuration for this specific request.
+   * If not specified, uses the default retry configuration from the client config.
+   */
+  retry?: Partial<RetryOptions>;
+};
+
+type RequestParams<Input = any> = {
+  method?: string;
+  targetUrl: string;
+  input?: Input;
+  config: RequiredConfig;
+  options?: RequestOptions & RequestInit;
+  headers?: Record<string, string>;
+};
 
 export async function dispatchRequest<Input, Output>(
-  method: string,
-  targetUrl: string,
-  input: Input
+  params: RequestParams<Input>,
 ): Promise<Output> {
+  const { targetUrl, input, config, options = {} } = params;
   const {
     credentials: credentialsValue,
     requestMiddleware,
     responseHandler,
-  } = getConfig();
-  const userAgent = isBrowser() ? {} : { 'User-Agent': getUserAgent() };
-  const credentials =
-    typeof credentialsValue === 'function'
-      ? credentialsValue()
-      : credentialsValue;
+    fetch,
+  } = config;
 
-  const { url, headers } = await requestMiddleware({
-    url: targetUrl,
-  });
-  const authHeader = credentials ? { Authorization: `Key ${credentials}` } : {};
-  if (typeof window !== 'undefined' && credentials) {
-    console.warn(
-      "The fal credentials are exposed in the browser's environment. " +
-        "That's not recommended for production use cases."
+  const retryOptions: RetryOptions = {
+    ...config.retry,
+    ...(options.retry || {}),
+  } as RetryOptions;
+
+  const executeRequest = async (): Promise<Output> => {
+    const userAgent = isBrowser() ? {} : { "User-Agent": getUserAgent() };
+    const credentials =
+      typeof credentialsValue === "function"
+        ? credentialsValue()
+        : credentialsValue;
+
+    const { method, url, headers } = await requestMiddleware({
+      method: (params.method ?? options.method ?? "post").toUpperCase(),
+      url: targetUrl,
+      headers: params.headers,
+    });
+    // Credentials only travel with requests addressed to a fal host. The check is on the
+    // request's own target, before any middleware (such as the proxy) changes where it is sent.
+    const authHeader =
+      credentials && isValidUrl(targetUrl)
+        ? { Authorization: `Key ${credentials}` }
+        : {};
+    const requestHeaders = {
+      ...authHeader,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...userAgent,
+      ...(headers ?? {}),
+    } as HeadersInit;
+
+    const {
+      responseHandler: customResponseHandler,
+      retry: _,
+      ...requestInit
+    } = options;
+    const response = await fetchWithBackupDomain(fetch, url, {
+      ...requestInit,
+      method,
+      headers: {
+        ...requestHeaders,
+        ...(requestInit.headers ?? {}),
+      },
+      ...(!isCloudflareWorkers && { mode: "cors" }),
+      signal: options.signal,
+      body:
+        method.toLowerCase() !== "get" && input
+          ? JSON.stringify(input)
+          : undefined,
+    });
+    const handleResponse = customResponseHandler ?? responseHandler;
+    return await handleResponse(response);
+  };
+
+  let lastError: any;
+  for (let attempt = 0; attempt <= retryOptions.maxRetries; attempt++) {
+    try {
+      return await executeRequest();
+    } catch (error) {
+      lastError = error;
+
+      const shouldNotRetry =
+        attempt === retryOptions.maxRetries ||
+        !isRetryableError(error, retryOptions.retryableStatusCodes) ||
+        options.signal?.aborted;
+      if (shouldNotRetry) {
+        throw error;
+      }
+
+      const delay = calculateBackoffDelay(
+        attempt,
+        retryOptions.baseDelay,
+        retryOptions.maxDelay,
+        retryOptions.backoffMultiplier,
+        retryOptions.enableJitter,
+      );
+
+      await sleep(delay);
+    }
+  }
+
+  throw lastError;
+}
+
+// Host name characters only. Any other character could end the URL authority early and point
+// the request at a different host. This does not check that the value is a well-formed host
+// name: a malformed one still resolves under fal.run, or fails the fal URL check in buildUrl.
+const SUBDOMAIN_PATTERN = /^[a-z0-9.-]+$/i;
+
+function resolveSubdomainPrefix(subdomain: unknown): string {
+  if (!subdomain) {
+    return "";
+  }
+  if (typeof subdomain !== "string" || !SUBDOMAIN_PATTERN.test(subdomain)) {
+    throw new Error(
+      `Invalid subdomain: ${JSON.stringify(subdomain)}. ` +
+        "It must be a host name made of letters, digits, hyphens and dots, e.g. `queue`.",
     );
   }
-  const requestHeaders = {
-    ...authHeader,
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-    ...userAgent,
-    ...(headers ?? {}),
-  } as HeadersInit;
-  const response = await fetch(url, {
-    method,
-    headers: requestHeaders,
-    ...(!isCloudflareWorkers && { mode: 'cors' }),
-    body:
-      method.toLowerCase() !== 'get' && input
-        ? JSON.stringify(input)
-        : undefined,
-  });
-  return await responseHandler(response);
+  return `${subdomain}.`;
+}
+
+/**
+ * Builds the final url to run the function based on its `id` or alias and
+ * a the options from `RunOptions<Input>`.
+ *
+ * @private
+ * @param id the function id or alias
+ * @param options the run options
+ * @returns the final url to run the function
+ */
+export function buildUrl<Input>(
+  id: string,
+  options: RunOptions<Input> & UrlOptions = {},
+): string {
+  const method = (options.method ?? "post").toLowerCase();
+  const path = (options.path ?? "").replace(/^\//, "").replace(/\/{2,}/, "/");
+  const input = options.input;
+  const params = {
+    ...(options.query || {}),
+    ...(method === "get" ? input : {}),
+  };
+
+  const queryParams =
+    Object.keys(params).length > 0
+      ? `?${new URLSearchParams(params).toString()}`
+      : "";
+
+  // if a fal url is passed, just use it
+  if (isValidUrl(id)) {
+    const url = id.endsWith("/") ? id : `${id}/`;
+    return `${url}${path}${queryParams}`;
+  }
+
+  const appId = ensureEndpointIdFormat(id);
+  const subdomain = resolveSubdomainPrefix(options.subdomain);
+  const url = `https://${subdomain}fal.run/${appId}/${path}`;
+  const result = `${url.replace(/\/$/, "")}${queryParams}`;
+  // Whatever went into the pieces above, the outcome must still be a fal URL.
+  if (!isValidUrl(result)) {
+    throw new Error(
+      `Invalid endpoint: ${id}. It does not resolve to a fal URL.`,
+    );
+  }
+  return result;
 }

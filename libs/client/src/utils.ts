@@ -1,14 +1,14 @@
-export function isUUIDv4(id: string): boolean {
-  return (
-    typeof id === 'string' &&
-    id.length === 36 &&
-    id[14] === '4' &&
-    ['8', '9', 'a', 'b'].includes(id[19])
-  );
-}
-
-export function ensureAppIdFormat(id: string): string {
-  const parts = id.split('/');
+export function ensureEndpointIdFormat(id: string): string {
+  // A scheme-bearing string is a URL that already failed isValidUrl (http://, a non-fal host…).
+  // Passing it through as an "endpoint id" would build https://fal.run/http://… — a silently
+  // mangled 404 — so reject it loudly with the actual constraint instead.
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(id)) {
+    throw new Error(
+      `Invalid endpoint: ${id}. URLs must be https:// and point at a fal.run or fal.ai host; ` +
+        "anything else must be an endpoint id in the format <appOwner>/<appId>.",
+    );
+  }
+  const parts = id.split("/");
   if (parts.length > 1) {
     return id;
   }
@@ -17,43 +17,77 @@ export function ensureAppIdFormat(id: string): string {
     return `${appOwner}/${appId}`;
   }
   throw new Error(
-    `Invalid app id: ${id}. Must be in the format <appOwner>/<appId>`
+    `Invalid app id: ${id}. Must be in the format <appOwner>/<appId>`,
   );
 }
 
-const APP_NAMESPACES = ['workflows'] as const;
+const ENDPOINT_NAMESPACES = ["workflows", "comfy"] as const;
 
-type AppNamespace = (typeof APP_NAMESPACES)[number];
+type EndpointNamespace = (typeof ENDPOINT_NAMESPACES)[number];
 
-export type AppId = {
+export type EndpointId = {
   readonly owner: string;
   readonly alias: string;
   readonly path?: string;
-  readonly namespace?: AppNamespace;
+  readonly namespace?: EndpointNamespace;
 };
 
-export function parseAppId(id: string): AppId {
-  const normalizedId = ensureAppIdFormat(id);
-  const parts = normalizedId.split('/');
-  if (APP_NAMESPACES.includes(parts[0] as any)) {
+export function parseEndpointId(id: string): EndpointId {
+  const normalizedId = ensureEndpointIdFormat(id);
+  const parts = normalizedId.split("/");
+  if (ENDPOINT_NAMESPACES.includes(parts[0] as any)) {
     return {
       owner: parts[1],
       alias: parts[2],
-      path: parts.slice(3).join('/') || undefined,
-      namespace: parts[0] as AppNamespace,
+      path: parts.slice(3).join("/") || undefined,
+      namespace: parts[0] as EndpointNamespace,
     };
   }
   return {
     owner: parts[0],
     alias: parts[1],
-    path: parts.slice(2).join('/') || undefined,
+    path: parts.slice(2).join("/") || undefined,
   };
+}
+
+/**
+ * Resolves the endpoint path, normalizing it and applying a default.
+ * If no explicit path is provided and the app already ends with the
+ * default path, returns undefined to avoid duplication.
+ *
+ * @param app - The app/endpoint identifier
+ * @param path - An explicitly provided path (always used if present)
+ * @param defaultPath - The default path to use (e.g. "/realtime")
+ * @returns The resolved path, or undefined if the app already includes it
+ */
+export function resolveEndpointPath(
+  app: string,
+  path: string | undefined,
+  defaultPath: string,
+): string | undefined {
+  if (path) {
+    return `/${path.replace(/^\/+/, "")}`;
+  }
+  if (app.endsWith(defaultPath)) {
+    return undefined;
+  }
+  return defaultPath;
 }
 
 export function isValidUrl(url: string) {
   try {
-    const { host } = new URL(url);
-    return /(fal\.(ai|run))$/.test(host);
+    const parsed = new URL(url);
+    const hostname = parsed.hostname.toLowerCase();
+    return (
+      parsed.protocol === "https:" &&
+      // No explicit nonstandard port: the URL parser normalizes :443 away, so any remaining port
+      // targets a different listener — credentials must not follow a fal hostname to it.
+      parsed.port === "" &&
+      (hostname === "fal.ai" ||
+        hostname.endsWith(".fal.ai") ||
+        hostname === "fal.run" ||
+        hostname.endsWith(".fal.run"))
+    );
   } catch (_) {
     return false;
   }
@@ -63,7 +97,7 @@ export function isValidUrl(url: string) {
 export function throttle<T extends (...args: any[]) => any>(
   func: T,
   limit: number,
-  leading = false
+  leading = false,
 ): (...funcArgs: Parameters<T>) => ReturnType<T> | void {
   let lastFunc: NodeJS.Timeout | null;
   let lastRan: number;
@@ -84,7 +118,7 @@ export function throttle<T extends (...args: any[]) => any>(
             lastRan = Date.now();
           }
         },
-        limit - (Date.now() - lastRan)
+        limit - (Date.now() - lastRan),
       );
     }
   };
@@ -106,8 +140,8 @@ export function isReact() {
     const stack = new Error().stack;
     isRunningInReact =
       !!stack &&
-      (stack.includes('node_modules/react-dom/') ||
-        stack.includes('node_modules/next/'));
+      (stack.includes("node_modules/react-dom/") ||
+        stack.includes("node_modules/next/"));
   }
   return isRunningInReact;
 }
@@ -119,4 +153,11 @@ export function isReact() {
  */
 export function isPlainObject(value: any): boolean {
   return !!value && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+/**
+ * Utility function to sleep for a given number of milliseconds
+ */
+export async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

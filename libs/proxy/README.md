@@ -1,15 +1,15 @@
 # fal.ai proxy library
 
-![@fal-ai/serverless-proxy npm package](https://img.shields.io/npm/v/@fal-ai/serverless-proxy?color=%237527D7&label=%40fal-ai%2Fserverless-proxy&style=flat-square)
+![@fal-ai/server-proxy npm package](https://img.shields.io/npm/v/@fal-ai/server-proxy?color=%237527D7&label=%40fal-ai%2Fserver-proxy&style=flat-square)
 
 ## Introduction
 
-The `@fal-ai/serverless-proxy` library enables you to route client requests through your own server, therefore safeguarding sensitive credentials. With built-in support for popular frameworks like Next.js and Express, setting up the proxy becomes a breeze.
+The `@fal-ai/server-proxy` library enables you to route client requests through your own server, therefore safeguarding sensitive credentials. With built-in support for popular frameworks like Next.js and Express, setting up the proxy becomes a breeze.
 
 ### Install the proxy library:
 
 ```
-npm install --save @fal-ai/serverless-proxy
+npm install --save @fal-ai/server-proxy
 ```
 
 ## Next.js page router integration
@@ -19,7 +19,7 @@ For Next.js applications using the page router:
 1. Create an API route in your Next.js app, as a convention we suggest using `pages/api/fal/proxy.js` (or `.ts` if you're using TypeScript):
 2. Re-export the proxy handler from the library as the default export:
    ```ts
-   export { handler as default } from '@fal-ai/serverless-proxy/nextjs';
+   export { handler as default } from "@fal-ai/server-proxy/nextjs";
    ```
 3. Ensure you've set the `FAL_KEY` as an environment variable in your server, containing a valid API Key.
 
@@ -31,9 +31,9 @@ For Next.js applications using the app router:
 2. Re-export the proxy handler from the library as the default export:
 
    ```ts
-   import { route } from '@fal-ai/serverless-proxy/nextjs';
+   import { route } from "@fal-ai/server-proxy/nextjs";
 
-   export const { GET, POST } = route;
+   export const { GET, POST, PUT } = route;
    ```
 
 3. Ensure you've set the `FAL_KEY` as an environment variable in your server, containing a valid API Key.
@@ -49,12 +49,12 @@ For Express applications:
 2. Add the proxy route and its handler. Note that if your client lives outside of the express app (i.e. the express app is solely used as an external API for other clients), you will need to allow CORS on the proxy route:
 
    ```ts
-   import * as falProxy from '@fal-ai/serverless-proxy/express';
+   import * as falProxy from "@fal-ai/server-proxy/express";
 
    app.all(
      falProxy.route, // '/api/fal/proxy' or you can use your own
      cors(), // if external clients will use the proxy
-     falProxy.handler
+     falProxy.handler,
    );
    ```
 
@@ -65,15 +65,74 @@ For Express applications:
 Once you've set up the proxy, you can configure the client to use it:
 
 ```ts
-import * as fal from '@fal-ai/serverless-client';
+import { fal } from "@fal-ai/client";
 
 fal.config({
-  proxyUrl: '/api/fal/proxy', // or https://my.app.com/api/fal/proxy
+  proxyUrl: "/api/fal/proxy", // or https://my.app.com/api/fal/proxy
 });
 ```
 
 Now all your client calls will route through your server proxy, so your credentials are protected.
 
+By default, the proxy middleware only runs in browser environments — requests made from Node, Electron, Bun, or edge/worker runtimes are sent directly to the fal API. To opt into the proxy in these runtimes, pass an object instead of a string:
+
+```ts
+fal.config({
+  proxyUrl: {
+    url: "/api/fal/proxy",
+    when: "always",
+  },
+});
+```
+
+`when` accepts:
+
+- `"browser"` — only in environments with a DOM `window` (default).
+- `"always"` — in every runtime.
+- `(env) => boolean` — a custom predicate. `env` is `{ isBrowser: boolean }`, so you can layer your own checks — for example, routing through the proxy only from an Electron renderer process:
+
+  ```ts
+  fal.config({
+    proxyUrl: {
+      url: "/api/fal/proxy",
+      when: ({ isBrowser }) => isBrowser || (typeof process !== "undefined" && process.type === "renderer"),
+    },
+  });
+  ```
+
+## Backup domains
+
+When the proxy cannot connect to a fal inference gateway, it retries the
+request once against a backup domain:
+
+| Primary         | Backup             |
+| --------------- | ------------------ |
+| `fal.run`       | `falrun.com`       |
+| `queue.fal.run` | `queue.falrun.com` |
+
+Only DNS and connection-establishment failures trigger the fallback. HTTP
+error responses, failures after the gateway has answered, and caller
+cancellation are passed through unchanged. Node error codes make that
+distinction; edge runtimes report a bare network error for both, so there a
+delivered request that got no response is also retried on the backup host.
+
+The Fetch API has no connect-phase timeout, so with an unreachable primary the
+proxy waits for the runtime's own connect timeout (about 10 seconds in Node)
+before trying the backup.
+
+If your server restricts outbound traffic, allow the backup domains as well.
+Target URLs are validated against the allowlist before any fallback, so the
+backup domains do not need to be in `allowedUrlPatterns`.
+
 ## More information
 
 For a deeper dive into the proxy library and its capabilities, explore the [official documentation](https://fal.ai/docs).
+
+### Server runtime certificate update
+
+Run proxy hosts on fixed Node: `22.23.4+` on Node 22, `24.22.1+` on Node 24, or
+`26.12.1+` on Node 26. Redeploy and restart existing processes. Package engine
+requirements do not update the deployed runtime. Check explicit CA overrides,
+custom fetch clients, and managed runtime trust separately; confirm both affected
+eMudhra/AAA chain families fail certificate validation while legitimate HTTPS
+continues to work.
